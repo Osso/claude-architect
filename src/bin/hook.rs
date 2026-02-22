@@ -64,10 +64,18 @@ fn extract_validate_request(json: &serde_json::Value) -> Option<Request> {
         .unwrap_or_default();
     let project = derive_project(&cwd);
 
+    // Send first 200 chars of prompt as context, not the full detailed prompt.
+    // The architect only needs enough to check for conflicts/gaps.
+    let summary = if prompt.is_empty() {
+        description.to_string()
+    } else {
+        truncate(prompt, 200)
+    };
+
     Some(Request::Validate {
         project,
         goal: description.to_string(),
-        tasks: vec![truncate(prompt, 2000)],
+        tasks: vec![summary],
         cwd,
     })
 }
