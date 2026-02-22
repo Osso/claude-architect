@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let response = dispatch(&state, request).await;
+            let response = dispatch(state, request).await;
 
             if let Err(e) = conn.write(&response).await {
                 eprintln!("write error: {e}");
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn dispatch(state: &ServerState, request: Request) -> Response {
+async fn dispatch(state: Arc<ServerState>, request: Request) -> Response {
     match request {
         Request::Ping => Response::Pong,
         Request::Validate {
@@ -117,7 +117,7 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
             tasks,
             cwd,
         } => {
-            let ps = get_project_state(state, &project).await;
+            let ps = get_project_state(&state, &project).await;
             match handle_validate(state, ps, &project, &goal, &tasks, &cwd).await {
                 Ok(verdict) => Response::Verdict(verdict),
                 Err(e) => Response::Error(format!("{e:#}")),
@@ -129,8 +129,8 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
             assessment,
             cwd,
         } => {
-            let ps = get_project_state(state, &project).await;
-            match handle_report(state, ps, &project, &task_description, &assessment, &cwd)
+            let ps = get_project_state(&state, &project).await;
+            match handle_report(&state, ps, &project, &task_description, &assessment, &cwd)
                 .await
             {
                 Ok(ack) => Response::Verdict(ack),
@@ -138,7 +138,7 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
             }
         }
         Request::Reset { project, cwd } => {
-            let ps = get_project_state(state, &project).await;
+            let ps = get_project_state(&state, &project).await;
             match handle_reset(state, ps, &project, &cwd).await {
                 Ok(msg) => Response::Verdict(msg),
                 Err(e) => Response::Error(format!("{e:#}")),
@@ -200,7 +200,7 @@ fn new_uuid() -> String {
 }
 
 async fn handle_validate(
-    server: &ServerState,
+    server: Arc<ServerState>,
     ps: Arc<ProjectState>,
     project: &str,
     goal: &str,
@@ -236,42 +236,61 @@ async fn handle_validate(
         info.created = true;
     }
 
-    persist_project(server, project, &info.session_id, info.validations).await;
+    persist_project(&server, project, &info.session_id, info.validations).await;
 
     // Generate design doc if it doesn't exist yet (first validation ever),
     // or every N validations (reset session to prevent auto-compaction).
     let should_generate = !design_path.exists() || info.validations % DESIGN_DOC_INTERVAL == 0;
-    if should_generate {
-        request_design_doc(server, &info.session_id, project, cwd).await;
-    }
-    if info.validations % DESIGN_DOC_INTERVAL == 0 {
+    let should_reset = info.validations % DESIGN_DOC_INTERVAL == 0;
+
+    // Clone data needed for background task before dropping the mutex.
+    let session_id_for_doc = info.session_id.clone();
+    let project_owned = project.to_string();
+    let cwd_owned = cwd.to_string();
+
+    if should_reset {
         info.session_id = new_uuid();
         info.created = false;
         info.validations = 0;
         info.pending_reports.clear();
-        persist_project(server, project, &info.session_id, 0).await;
+        persist_project(&server, project, &info.session_id, 0).await;
+    }
+
+    // Drop mutex before spawning background work.
+    drop(info);
+
+    if should_generate {
+        tokio::spawn(async move {
+            request_design_doc(server, session_id_for_doc, project_owned, cwd_owned).await;
+        });
     }
 
     Ok(response)
 }
 
 async fn handle_reset(
-    server: &ServerState,
+    server: Arc<ServerState>,
     ps: Arc<ProjectState>,
     project: &str,
     cwd: &str,
 ) -> Result<String> {
     let mut info = ps.mutex.lock().await;
 
-    if info.created {
-        request_design_doc(server, &info.session_id, project, cwd).await;
-    }
+    let session_id_for_doc = info.session_id.clone();
+    let was_created = info.created;
 
     info.session_id = new_uuid();
     info.created = false;
     info.validations = 0;
     info.pending_reports.clear();
-    persist_project(server, project, &info.session_id, 0).await;
+    persist_project(&server, project, &info.session_id, 0).await;
+
+    drop(info);
+
+    if was_created {
+        // Reset is user-triggered and infrequent; await the doc generation directly.
+        request_design_doc(server, session_id_for_doc, project.to_string(), cwd.to_string()).await;
+    }
 
     Ok(format!("Session reset for {project}. Design doc regenerated."))
 }
@@ -309,10 +328,10 @@ async fn persist_project(
 }
 
 async fn request_design_doc(
-    server: &ServerState,
-    session_id: &str,
-    project: &str,
-    cwd: &str,
+    server: Arc<ServerState>,
+    session_id: String,
+    project: String,
+    cwd: String,
 ) {
     let prompt = "Summarize your current understanding of this project's \
         architecture into a concise design document. Cover: key modules, \
@@ -321,7 +340,7 @@ async fn request_design_doc(
         no preamble.";
 
     let design_path = server.designs_dir().join(format!("{project}.md"));
-    match call_claude(prompt, session_id, true, &design_path, cwd).await {
+    match call_claude(prompt, &session_id, true, &design_path, &cwd).await {
         Ok(doc) => {
             if let Err(e) = std::fs::write(&design_path, &doc) {
                 eprintln!("failed to write design doc: {e}");
@@ -345,6 +364,8 @@ async fn call_claude(
         .arg(prompt)
         .arg("--model")
         .arg("opus")
+        .arg("--effort")
+        .arg("low")
         .arg("--permission-mode")
         .arg("dontAsk")
         .arg("--allowedTools")
@@ -369,7 +390,14 @@ async fn call_claude(
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.context("spawn claude")?;
+    let child = cmd.spawn().context("spawn claude")?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        child.wait_with_output(),
+    )
+    .await
+    .context("claude CLI timed out after 120s")?
+    .context("spawn claude")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

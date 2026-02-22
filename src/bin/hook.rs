@@ -2,8 +2,9 @@ use claude_architect::{
     Request, Response, build_assessment_prompt, contains_incomplete, contains_needs_changes,
     deny_json, feedback_json, should_skip, socket_path, truncate,
 };
-use peercred_ipc::Client;
+use peercred_ipc::{Client, IpcError};
 use std::io::Read;
+use std::time::Duration;
 
 fn main() {
     let mut input = String::new();
@@ -82,8 +83,12 @@ fn extract_validate_request(json: &serde_json::Value) -> Option<Request> {
 
 fn validate_and_respond(request: Request) {
     let path = socket_path();
-    let response = match Client::call::<_, Request, Response>(&path, &request) {
+    let response = match Client::call_timeout::<_, Request, Response>(&path, &request, Duration::from_secs(180)) {
         Ok(r) => r,
+        Err(IpcError::Timeout(_)) => {
+            eprintln!("claude-architect-hook: architect validation timed out, allowing");
+            return;
+        }
         Err(e) => {
             eprintln!("claude-architect-hook: service error: {e}");
             return;
@@ -161,8 +166,10 @@ fn try_post_tool_use(
     // Fire-and-forget: send report to daemon in a background thread.
     std::thread::spawn(move || {
         let path = socket_path();
-        if let Err(e) = Client::call::<_, Request, Response>(&path, &request) {
-            eprintln!("claude-architect-hook: report failed: {e}");
+        if let Err(e) = Client::call_timeout::<_, Request, Response>(&path, &request, Duration::from_secs(30)) {
+            if !matches!(e, IpcError::Timeout(_)) {
+                eprintln!("claude-architect-hook: report failed: {e}");
+            }
         }
     });
 

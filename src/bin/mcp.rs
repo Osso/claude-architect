@@ -8,6 +8,8 @@ use rmcp::transport::stdio;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::time::Duration;
+use tokio::time::timeout;
 
 #[derive(Clone)]
 struct ArchitectMcp {
@@ -59,16 +61,24 @@ impl ArchitectMcp {
         };
 
         let path = socket_path();
-        match tokio::task::spawn_blocking(move || {
-            Client::call::<_, Request, Response>(&path, &request)
-        })
+        match timeout(
+            Duration::from_secs(190),
+            tokio::task::spawn_blocking(move || {
+                Client::call_timeout::<_, Request, Response>(
+                    &path,
+                    &request,
+                    Duration::from_secs(180),
+                )
+            }),
+        )
         .await
         {
-            Ok(Ok(Response::Verdict(v))) => v,
-            Ok(Ok(Response::Error(e))) => format!("Architect error: {e}"),
-            Ok(Ok(Response::Pong)) => "Unexpected pong response".to_string(),
-            Ok(Err(e)) => format!("IPC error (is claude-architect service running?): {e}"),
-            Err(e) => format!("Task join error: {e}"),
+            Err(_elapsed) => "architect validation timed out".to_string(),
+            Ok(Err(e)) => format!("Task join error: {e}"),
+            Ok(Ok(Ok(Response::Verdict(v)))) => v,
+            Ok(Ok(Ok(Response::Error(e)))) => format!("Architect error: {e}"),
+            Ok(Ok(Ok(Response::Pong))) => "Unexpected pong response".to_string(),
+            Ok(Ok(Err(e))) => format!("IPC error (is claude-architect service running?): {e}"),
         }
     }
 }
