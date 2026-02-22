@@ -13,6 +13,16 @@ use tokio::sync::Mutex;
 
 const DESIGN_DOC_INTERVAL: u32 = 20;
 
+const ALLOWED_TOOLS: &[&str] = &[
+    "Read",
+    "Glob",
+    "Grep",
+    "mcp__claude-memory__memory_write",
+    "mcp__claude-memory__memory_list",
+    "mcp__claude-memory__prompt_search",
+    "mcp__claude-memory__answer_search",
+];
+
 /// Per-project state: serialization mutex + session tracking.
 struct ProjectState {
     mutex: Mutex<SessionInfo>,
@@ -169,16 +179,12 @@ async fn handle_validate(
 
     let prompt = build_validation_prompt(goal, tasks);
 
-    let design_doc = if !info.created {
-        load_design_doc(server, project)
-    } else {
-        None
-    };
+    let design_path = server.designs_dir().join(format!("{project}.md"));
     let response = call_claude(
         &prompt,
         &info.session_id,
         info.created,
-        design_doc.as_deref(),
+        &design_path,
     )
     .await?;
 
@@ -257,7 +263,14 @@ async fn call_claude(
     design_doc: Option<&str>,
 ) -> Result<String> {
     let mut cmd = Command::new("claude");
-    cmd.arg("-p").arg(prompt).arg("--model").arg("opus");
+    cmd.arg("-p")
+        .arg(prompt)
+        .arg("--model")
+        .arg("opus")
+        .arg("--permission-mode")
+        .arg("dontAsk")
+        .arg("--allowedTools")
+        .arg(ALLOWED_TOOLS.join(","));
     cmd.env_remove("CLAUDECODE");
 
     if resume {
