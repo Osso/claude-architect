@@ -97,35 +97,51 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let response = match request {
-                Request::Ping => Response::Pong,
-                Request::Validate {
-                    project,
-                    goal,
-                    tasks,
-                    cwd,
-                } => {
-                    let ps = get_project_state(&state, &project).await;
-                    match handle_validate(&state, ps, &project, &goal, &tasks, &cwd)
-                        .await
-                    {
-                        Ok(verdict) => Response::Verdict(verdict),
-                        Err(e) => Response::Error(format!("{e:#}")),
-                    }
-                }
-                Request::Reset { project, cwd } => {
-                    let ps = get_project_state(&state, &project).await;
-                    match handle_reset(&state, ps, &project, &cwd).await {
-                        Ok(msg) => Response::Verdict(msg),
-                        Err(e) => Response::Error(format!("{e:#}")),
-                    }
-                }
-            };
+            let response = dispatch(&state, request).await;
 
             if let Err(e) = conn.write(&response).await {
                 eprintln!("write error: {e}");
             }
         });
+    }
+}
+
+async fn dispatch(state: &ServerState, request: Request) -> Response {
+    match request {
+        Request::Ping => Response::Pong,
+        Request::Validate {
+            project,
+            goal,
+            tasks,
+            cwd,
+        } => {
+            let ps = get_project_state(state, &project).await;
+            match handle_validate(state, ps, &project, &goal, &tasks, &cwd).await {
+                Ok(verdict) => Response::Verdict(verdict),
+                Err(e) => Response::Error(format!("{e:#}")),
+            }
+        }
+        Request::Report {
+            project,
+            task_description,
+            assessment,
+            cwd,
+        } => {
+            let ps = get_project_state(state, &project).await;
+            match handle_report(state, ps, &project, &task_description, &assessment, &cwd)
+                .await
+            {
+                Ok(ack) => Response::Verdict(ack),
+                Err(e) => Response::Error(format!("{e:#}")),
+            }
+        }
+        Request::Reset { project, cwd } => {
+            let ps = get_project_state(state, &project).await;
+            match handle_reset(state, ps, &project, &cwd).await {
+                Ok(msg) => Response::Verdict(msg),
+                Err(e) => Response::Error(format!("{e:#}")),
+            }
+        }
     }
 }
 
@@ -242,6 +258,30 @@ async fn handle_reset(
     persist_project(server, project, &info.session_id, 0).await;
 
     Ok(format!("Session reset for {project}. Design doc regenerated."))
+}
+
+async fn handle_report(
+    server: &ServerState,
+    ps: Arc<ProjectState>,
+    project: &str,
+    task_description: &str,
+    assessment: &str,
+    cwd: &str,
+) -> Result<String> {
+    let info = ps.mutex.lock().await;
+
+    if !info.created {
+        return Ok("No active session to report to".to_string());
+    }
+
+    let prompt = format!(
+        "## Task Completion Report\n\n\
+         Task: {task_description}\n\
+         Status: {assessment}"
+    );
+
+    let design_path = server.designs_dir().join(format!("{project}.md"));
+    call_claude(&prompt, &info.session_id, true, &design_path, cwd).await
 }
 
 async fn persist_project(

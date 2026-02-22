@@ -11,6 +11,13 @@ pub enum Request {
     },
     /// Regenerate design doc and reset session for a project.
     Reset { project: String, cwd: String },
+    /// Brief completion report from a finished task (assessed by Haiku).
+    Report {
+        project: String,
+        task_description: String,
+        assessment: String,
+        cwd: String,
+    },
     Ping,
 }
 
@@ -74,6 +81,33 @@ pub fn deny_json(reason: &str) -> String {
     )
 }
 
+/// Build the prompt for Haiku to assess whether a task was accomplished.
+pub fn build_assessment_prompt(description: &str, result: &str) -> String {
+    format!(
+        "Assess whether this task was accomplished.\n\n\
+         ## Task\n{description}\n\n\
+         ## Output\n{result}\n\n\
+         Respond with exactly one line:\n\
+         ACCOMPLISHED - if the task was completed successfully\n\
+         INCOMPLETE: <brief reason> - if not completed or only partially done"
+    )
+}
+
+/// Build the PostToolUse response JSON with additionalContext feedback.
+pub fn feedback_json(feedback: &str) -> String {
+    let escaped = feedback.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        r#"{{"hookSpecificOutput":{{"hookEventName":"PostToolUse","additionalContext":"Architect: {escaped}"}}}}"#
+    )
+}
+
+/// Check if a Haiku assessment indicates the task was incomplete.
+pub fn contains_incomplete(assessment: &str) -> bool {
+    assessment
+        .lines()
+        .any(|line| line.starts_with("INCOMPLETE"))
+}
+
 /// Build the validation prompt sent to claude.
 pub fn build_validation_prompt(goal: &str, tasks: &[String]) -> String {
     let mut prompt = String::new();
@@ -116,6 +150,19 @@ mod tests {
             project: "test-project".into(),
             goal: "deploy feature".into(),
             tasks: vec!["write code".into(), "run tests".into()],
+            cwd: "/home/user/projects/test".into(),
+        };
+        let bytes = rmp_serde::to_vec(&req).unwrap();
+        let decoded: Request = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn roundtrip_report() {
+        let req = Request::Report {
+            project: "myproject".into(),
+            task_description: "fix auth bug".into(),
+            assessment: "ACCOMPLISHED".into(),
             cwd: "/home/user/projects/test".into(),
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
@@ -278,6 +325,67 @@ mod tests {
         let prompt = build_validation_prompt("goal", &[]);
         assert!(prompt.contains("## Tasks to Validate\n\n"));
         assert!(!prompt.contains("1."));
+    }
+
+    // --- build_assessment_prompt ---
+
+    #[test]
+    fn assessment_prompt_includes_task_and_output() {
+        let prompt = build_assessment_prompt("fix login", "done, all tests pass");
+        assert!(prompt.contains("## Task\nfix login"));
+        assert!(prompt.contains("## Output\ndone, all tests pass"));
+        assert!(prompt.contains("ACCOMPLISHED"));
+        assert!(prompt.contains("INCOMPLETE"));
+    }
+
+    // --- feedback_json ---
+
+    #[test]
+    fn feedback_json_basic() {
+        let json = feedback_json("task incomplete");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"],
+            "PostToolUse"
+        );
+        let ctx = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains("task incomplete"));
+    }
+
+    #[test]
+    fn feedback_json_escapes_quotes() {
+        let json = feedback_json(r#"missing "tests""#);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let ctx = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains(r#"missing "tests""#));
+    }
+
+    // --- contains_incomplete ---
+
+    #[test]
+    fn detects_incomplete() {
+        assert!(contains_incomplete("INCOMPLETE: no tests added"));
+    }
+
+    #[test]
+    fn detects_accomplished() {
+        assert!(!contains_incomplete("ACCOMPLISHED"));
+    }
+
+    #[test]
+    fn incomplete_must_be_line_start() {
+        assert!(!contains_incomplete("task was INCOMPLETE maybe"));
+    }
+
+    #[test]
+    fn incomplete_multiline() {
+        assert!(contains_incomplete(
+            "some preamble\nINCOMPLETE: partial\nmore"
+        ));
     }
 
     // --- strip_frontmatter ---
