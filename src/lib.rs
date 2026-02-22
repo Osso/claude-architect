@@ -9,6 +9,8 @@ pub enum Request {
         /// Working directory of the calling project.
         cwd: String,
     },
+    /// Regenerate design doc and reset session for a project.
+    Reset { project: String, cwd: String },
     Ping,
 }
 

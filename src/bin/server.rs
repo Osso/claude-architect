@@ -113,6 +113,13 @@ async fn main() -> Result<()> {
                         Err(e) => Response::Error(format!("{e:#}")),
                     }
                 }
+                Request::Reset { project, cwd } => {
+                    let ps = get_project_state(&state, &project).await;
+                    match handle_reset(&state, ps, &project, &cwd).await {
+                        Ok(msg) => Response::Verdict(msg),
+                        Err(e) => Response::Error(format!("{e:#}")),
+                    }
+                }
             };
 
             if let Err(e) = conn.write(&response).await {
@@ -215,6 +222,26 @@ async fn handle_validate(
     }
 
     Ok(response)
+}
+
+async fn handle_reset(
+    server: &ServerState,
+    ps: Arc<ProjectState>,
+    project: &str,
+    cwd: &str,
+) -> Result<String> {
+    let mut info = ps.mutex.lock().await;
+
+    if info.created {
+        request_design_doc(server, &info.session_id, project, cwd).await;
+    }
+
+    info.session_id = new_uuid();
+    info.created = false;
+    info.validations = 0;
+    persist_project(server, project, &info.session_id, 0).await;
+
+    Ok(format!("Session reset for {project}. Design doc regenerated."))
 }
 
 async fn persist_project(

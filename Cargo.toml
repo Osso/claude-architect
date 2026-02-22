@@ -15,6 +15,10 @@ path = "src/bin/mcp.rs"
 name = "claude-architect-hook"
 path = "src/bin/hook.rs"
 
+[[bin]]
+name = "claude-architect-ctl"
+path = "src/bin/ctl.rs"
+
 [dependencies]
 anyhow = "1"
 dirs = "6"
