@@ -1,4 +1,7 @@
-use claude_architect::{EXPLORATION_AGENTS, Request, Response, socket_path};
+use claude_architect::{
+    Request, Response, contains_needs_changes, deny_json, should_skip, socket_path,
+    truncate,
+};
 use peercred_ipc::Client;
 use std::io::Read;
 
@@ -64,7 +67,7 @@ fn main() {
     match response {
         Response::Verdict(verdict) => {
             if contains_needs_changes(&verdict) {
-                deny(&verdict);
+                println!("{}", deny_json(&verdict));
             }
             // VERDICT: ok — allow through (exit 0)
         }
@@ -76,40 +79,9 @@ fn main() {
     }
 }
 
-fn should_skip(subagent_type: &str) -> bool {
-    if subagent_type.is_empty() {
-        return false; // Unknown type, validate it
-    }
-    EXPLORATION_AGENTS
-        .iter()
-        .any(|&a| a.eq_ignore_ascii_case(subagent_type))
-}
-
 fn derive_project() -> String {
     std::env::current_dir()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_default()
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let end = s.floor_char_boundary(max);
-        format!("{}...", &s[..end])
-    }
-}
-
-fn contains_needs_changes(verdict: &str) -> bool {
-    verdict
-        .lines()
-        .any(|line| line.contains("VERDICT:") && line.contains("needs-changes"))
-}
-
-fn deny(reason: &str) {
-    let escaped = reason.replace('\\', "\\\\").replace('"', "\\\"");
-    println!(
-        r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Architect: {escaped}"}}}}"#
-    );
 }

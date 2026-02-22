@@ -1,16 +1,67 @@
 use anyhow::{Context, Result};
-use claude_architect::{Request, Response, socket_path};
-use peercred_ipc::Server;
-use qdrant_client::Qdrant;
-use qdrant_client::qdrant::{
-    Condition, Filter, PointStruct, ScrollPointsBuilder, UpsertPointsBuilder,
+use claude_architect::{
+    Request, Response, build_validation_prompt, socket_path, strip_frontmatter,
 };
+use peercred_ipc::Server;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
-const QDRANT_URL: &str = "http://localhost:6334";
-const COLLECTION: &str = "claude-memory";
-const VECTOR_SIZE: usize = 1024;
+const DESIGN_DOC_INTERVAL: u32 = 20;
+
+/// Per-project state: serialization mutex + session tracking.
+struct ProjectState {
+    mutex: Mutex<SessionInfo>,
+}
+
+struct SessionInfo {
+    session_id: String,
+    created: bool,
+    validations: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PersistedProject {
+    session_id: String,
+    validations: u32,
+}
+
+struct ServerState {
+    projects: Mutex<HashMap<String, Arc<ProjectState>>>,
+    data_dir: PathBuf,
+    persisted: Mutex<HashMap<String, PersistedProject>>,
+}
+
+impl ServerState {
+    fn load(data_dir: PathBuf) -> Arc<Self> {
+        let sessions_file = data_dir.join("sessions.json");
+        let persisted = std::fs::read_to_string(&sessions_file)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Arc::new(Self {
+            projects: Mutex::new(HashMap::new()),
+            data_dir,
+            persisted: Mutex::new(persisted),
+        })
+    }
+
+    async fn save(&self) {
+        let map = self.persisted.lock().await;
+        let path = self.data_dir.join("sessions.json");
+        if let Ok(json) = serde_json::to_string_pretty(&*map) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+
+    fn designs_dir(&self) -> PathBuf {
+        self.data_dir.join("designs")
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,8 +69,15 @@ async fn main() -> Result<()> {
     let server = Server::bind(&path)?;
     eprintln!("claude-architect listening on {path}");
 
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/claude"))
+        .join("claude-architect");
+    std::fs::create_dir_all(data_dir.join("designs"))?;
+    let state = ServerState::load(data_dir);
+
     loop {
         let (mut conn, _caller) = server.accept().await?;
+        let state = state.clone();
         tokio::spawn(async move {
             let request: Request = match conn.read().await {
                 Ok(r) => r,
@@ -35,10 +93,15 @@ async fn main() -> Result<()> {
                     project,
                     goal,
                     tasks,
-                } => match handle_validate(&project, &goal, &tasks).await {
-                    Ok(verdict) => Response::Verdict(verdict),
-                    Err(e) => Response::Error(format!("{e:#}")),
-                },
+                } => {
+                    let ps = get_project_state(&state, &project).await;
+                    match handle_validate(&state, ps, &project, &goal, &tasks)
+                        .await
+                    {
+                        Ok(verdict) => Response::Verdict(verdict),
+                        Err(e) => Response::Error(format!("{e:#}")),
+                    }
+                }
             };
 
             if let Err(e) = conn.write(&response).await {
@@ -48,134 +111,170 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_validate(project: &str, goal: &str, tasks: &[String]) -> Result<String> {
-    let memories = load_memories(project).await;
-    let instructions = load_architect_prompt()?;
-    let prompt = build_prompt(&instructions, &memories, goal, tasks);
-    let response = call_claude(&prompt).await?;
-    extract_and_store_memories(&response, project).await;
+async fn get_project_state(
+    state: &ServerState,
+    project: &str,
+) -> Arc<ProjectState> {
+    let mut map = state.projects.lock().await;
+    map.entry(project.to_string())
+        .or_insert_with(|| {
+            let persisted = state.persisted.try_lock().ok();
+            match persisted.as_ref().and_then(|p| p.get(project)) {
+                Some(pp) => Arc::new(ProjectState {
+                    mutex: Mutex::new(SessionInfo {
+                        session_id: pp.session_id.clone(),
+                        created: true,
+                        validations: pp.validations,
+                    }),
+                }),
+                None => Arc::new(ProjectState {
+                    mutex: Mutex::new(SessionInfo {
+                        session_id: new_uuid(),
+                        created: false,
+                        validations: 0,
+                    }),
+                }),
+            }
+        })
+        .clone()
+}
+
+fn new_uuid() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::SystemTime;
+    let mut h = DefaultHasher::new();
+    SystemTime::now().hash(&mut h);
+    std::process::id().hash(&mut h);
+    let n = h.finish();
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (n >> 32) as u32,
+        (n >> 16) as u16,
+        (n & 0xFFFF) as u16,
+        ((n >> 48) ^ (n >> 32)) as u16,
+        n ^ 0xCAFE_BABE_DEAD
+    )
+}
+
+async fn handle_validate(
+    server: &ServerState,
+    ps: Arc<ProjectState>,
+    project: &str,
+    goal: &str,
+    tasks: &[String],
+) -> Result<String> {
+    // Serialize requests for this project
+    let mut info = ps.mutex.lock().await;
+
+    let prompt = build_validation_prompt(goal, tasks);
+
+    let design_doc = if !info.created {
+        load_design_doc(server, project)
+    } else {
+        None
+    };
+    let response = call_claude(
+        &prompt,
+        &info.session_id,
+        info.created,
+        design_doc.as_deref(),
+    )
+    .await?;
+
+    info.validations += 1;
+    if !info.created {
+        info.created = true;
+    }
+
+    persist_project(server, project, &info.session_id, info.validations).await;
+
+    // Every N validations, generate a design doc and reset the session.
+    // This prevents auto-compaction from degrading context quality —
+    // the next validation starts fresh with the design doc loaded.
+    if info.validations % DESIGN_DOC_INTERVAL == 0 {
+        request_design_doc(server, &info.session_id, project).await;
+        info.session_id = new_uuid();
+        info.created = false;
+        info.validations = 0;
+        persist_project(server, project, &info.session_id, 0).await;
+    }
+
     Ok(response)
 }
 
-async fn load_memories(project: &str) -> Vec<String> {
-    match try_load_memories(project).await {
-        Ok(mems) => mems,
-        Err(e) => {
-            eprintln!("warning: failed to load memories: {e:#}");
-            Vec::new()
-        }
-    }
+async fn persist_project(
+    server: &ServerState,
+    project: &str,
+    session_id: &str,
+    validations: u32,
+) {
+    let mut persisted = server.persisted.lock().await;
+    persisted.insert(
+        project.to_string(),
+        PersistedProject {
+            session_id: session_id.to_string(),
+            validations,
+        },
+    );
+    drop(persisted);
+    server.save().await;
 }
 
-async fn try_load_memories(project: &str) -> Result<Vec<String>> {
-    let client = Qdrant::from_url(QDRANT_URL)
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .context("qdrant connect")?;
+fn load_design_doc(server: &ServerState, project: &str) -> Option<String> {
+    let path = server.designs_dir().join(format!("{project}.md"));
+    std::fs::read_to_string(path).ok()
+}
 
-    let mut conditions = vec![Condition::matches(
-        "category",
-        "architect".to_string(),
-    )];
-    if !project.is_empty() {
-        conditions.push(Condition::matches("project", project.to_string()));
-    }
-    let filter = Filter::must(conditions);
+async fn request_design_doc(
+    server: &ServerState,
+    session_id: &str,
+    project: &str,
+) {
+    let prompt = "Summarize your current understanding of this project's \
+        architecture into a concise design document. Cover: key modules, \
+        ownership boundaries, recurring patterns, known constraints, and \
+        common task decomposition pitfalls. Output ONLY the document content, \
+        no preamble.";
 
-    let mut entries = Vec::new();
-    let mut offset = None;
-
-    loop {
-        let mut scroll = ScrollPointsBuilder::new(COLLECTION)
-            .limit(100)
-            .with_payload(true)
-            .filter(filter.clone());
-        if let Some(off) = offset {
-            scroll = scroll.offset(off);
-        }
-
-        let result = client.scroll(scroll).await.context("scroll")?;
-        for point in &result.result {
-            if let Some(text) = get_payload_string(&point.payload, "text") {
-                entries.push(text);
+    match call_claude(prompt, session_id, true, None).await {
+        Ok(doc) => {
+            let path = server.designs_dir().join(format!("{project}.md"));
+            if let Err(e) = std::fs::write(&path, &doc) {
+                eprintln!("failed to write design doc: {e}");
+            } else {
+                eprintln!("updated design doc for {project}");
             }
         }
+        Err(e) => eprintln!("design doc request failed: {e:#}"),
+    }
+}
 
-        offset = result.next_page_offset;
-        if offset.is_none() {
-            break;
+async fn call_claude(
+    prompt: &str,
+    session_id: &str,
+    resume: bool,
+    design_doc: Option<&str>,
+) -> Result<String> {
+    let mut cmd = Command::new("claude");
+    cmd.arg("-p").arg(prompt).arg("--model").arg("opus");
+    cmd.env_remove("CLAUDECODE");
+
+    if resume {
+        cmd.arg("--resume").arg(session_id);
+    } else {
+        let mut system = load_architect_prompt()?;
+        if let Some(doc) = design_doc {
+            system.push_str("\n\n## Existing Design Document\n\n");
+            system.push_str(doc);
         }
+        cmd.arg("--session-id").arg(session_id);
+        cmd.arg("--system-prompt").arg(system);
     }
 
-    Ok(entries)
-}
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-fn get_payload_string(
-    payload: &std::collections::HashMap<String, qdrant_client::qdrant::Value>,
-    key: &str,
-) -> Option<String> {
-    payload
-        .get(key)
-        .and_then(|v| v.kind.as_ref())
-        .and_then(|k| match k {
-            qdrant_client::qdrant::value::Kind::StringValue(s) => Some(s.clone()),
-            _ => None,
-        })
-}
-
-fn load_architect_prompt() -> Result<String> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let path = format!("{home}/.claude/agents/architect.md");
-    let content =
-        std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-
-    // Strip YAML frontmatter
-    if content.starts_with("---") {
-        if let Some(end) = content[3..].find("---") {
-            return Ok(content[end + 6..].trim_start().to_string());
-        }
-    }
-    Ok(content)
-}
-
-fn build_prompt(
-    instructions: &str,
-    memories: &[String],
-    goal: &str,
-    tasks: &[String],
-) -> String {
-    let mut prompt = String::new();
-    prompt.push_str(instructions);
-    prompt.push_str("\n\n");
-
-    if !memories.is_empty() {
-        prompt.push_str("## Prior Knowledge\n\n");
-        for mem in memories {
-            prompt.push_str("- ");
-            prompt.push_str(mem);
-            prompt.push('\n');
-        }
-        prompt.push('\n');
-    }
-
-    prompt.push_str("## Goal\n\n");
-    prompt.push_str(goal);
-    prompt.push_str("\n\n## Tasks to Validate\n\n");
-    for (i, task) in tasks.iter().enumerate() {
-        prompt.push_str(&format!("{}. {}\n", i + 1, task));
-    }
-
-    prompt
-}
-
-async fn call_claude(prompt: &str) -> Result<String> {
-    let output = Command::new("claude")
-        .args(["-p", prompt, "--model", "opus"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("spawn claude")?;
+    let output = cmd.output().await.context("spawn claude")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -185,74 +284,10 @@ async fn call_claude(prompt: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-async fn extract_and_store_memories(response: &str, project: &str) {
-    let memories = parse_remember_section(response);
-    if memories.is_empty() {
-        return;
-    }
-    if let Err(e) = store_memories(&memories, project).await {
-        eprintln!("failed to store memories: {e:#}");
-    }
-}
-
-fn parse_remember_section(response: &str) -> Vec<String> {
-    let mut memories = Vec::new();
-    let mut in_remember = false;
-
-    for line in response.lines() {
-        if line.trim() == "REMEMBER:" {
-            in_remember = true;
-            continue;
-        }
-        if in_remember {
-            let trimmed = line.trim();
-            if trimmed.is_empty()
-                || (!trimmed.starts_with('-') && !trimmed.starts_with('*'))
-            {
-                break;
-            }
-            let text = trimmed
-                .trim_start_matches(|c| c == '-' || c == '*')
-                .trim();
-            if !text.is_empty() {
-                memories.push(text.to_string());
-            }
-        }
-    }
-
-    memories
-}
-
-async fn store_memories(memories: &[String], project: &str) -> Result<()> {
-    let client = Qdrant::from_url(QDRANT_URL)
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .context("qdrant connect")?;
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    let zero_vec = vec![0.0f32; VECTOR_SIZE];
-
-    for (i, text) in memories.iter().enumerate() {
-        let point = PointStruct::new(
-            now + i as u64,
-            zero_vec.clone(),
-            [
-                ("text", text.clone().into()),
-                ("source", "architect-service".to_string().into()),
-                ("category", "architect".to_string().into()),
-                ("project", project.to_string().into()),
-                ("hash", String::new().into()),
-            ],
-        );
-        client
-            .upsert_points(UpsertPointsBuilder::new(COLLECTION, vec![point]))
-            .await
-            .context("upsert")?;
-    }
-
-    Ok(())
+fn load_architect_prompt() -> Result<String> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let path = format!("{home}/.claude/agents/architect.md");
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+    Ok(strip_frontmatter(&content).to_string())
 }
