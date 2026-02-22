@@ -32,6 +32,9 @@ struct ValidateParams {
 
     /// Short task descriptions to validate (1-2 sentences each)
     tasks: Vec<String>,
+
+    /// Working directory of the project (defaults to current directory)
+    cwd: Option<String>,
 }
 
 #[tool_router]
@@ -43,10 +46,16 @@ impl ArchitectMcp {
         &self,
         Parameters(params): Parameters<ValidateParams>,
     ) -> String {
+        let cwd = params.cwd.unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
         let request = Request::Validate {
             project: params.project,
             goal: params.goal,
             tasks: params.tasks,
+            cwd,
         };
 
         let path = socket_path();

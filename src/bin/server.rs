@@ -103,9 +103,10 @@ async fn main() -> Result<()> {
                     project,
                     goal,
                     tasks,
+                    cwd,
                 } => {
                     let ps = get_project_state(&state, &project).await;
-                    match handle_validate(&state, ps, &project, &goal, &tasks)
+                    match handle_validate(&state, ps, &project, &goal, &tasks, &cwd)
                         .await
                     {
                         Ok(verdict) => Response::Verdict(verdict),
@@ -153,17 +154,21 @@ fn new_uuid() -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::time::SystemTime;
-    let mut h = DefaultHasher::new();
-    SystemTime::now().hash(&mut h);
-    std::process::id().hash(&mut h);
-    let n = h.finish();
+    let mut h1 = DefaultHasher::new();
+    SystemTime::now().hash(&mut h1);
+    std::process::id().hash(&mut h1);
+    let a = h1.finish();
+    let mut h2 = DefaultHasher::new();
+    a.hash(&mut h2);
+    let b = h2.finish();
+    // UUIDv4: version nibble = 4, variant bits = 10xx
     format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (n >> 32) as u32,
-        (n >> 16) as u16,
-        (n & 0xFFFF) as u16,
-        ((n >> 48) ^ (n >> 32)) as u16,
-        n ^ 0xCAFE_BABE_DEAD
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (a >> 32) as u32,
+        (a >> 16) as u16 & 0xFFFF,
+        a as u16 & 0x0FFF,
+        (b >> 48) as u16 & 0x3FFF | 0x8000,
+        b & 0xFFFF_FFFF_FFFF,
     )
 }
 
@@ -173,18 +178,19 @@ async fn handle_validate(
     project: &str,
     goal: &str,
     tasks: &[String],
+    cwd: &str,
 ) -> Result<String> {
-    // Serialize requests for this project
     let mut info = ps.mutex.lock().await;
 
     let prompt = build_validation_prompt(goal, tasks);
-
     let design_path = server.designs_dir().join(format!("{project}.md"));
+
     let response = call_claude(
         &prompt,
         &info.session_id,
         info.created,
         &design_path,
+        cwd,
     )
     .await?;
 
@@ -195,11 +201,13 @@ async fn handle_validate(
 
     persist_project(server, project, &info.session_id, info.validations).await;
 
-    // Every N validations, generate a design doc and reset the session.
-    // This prevents auto-compaction from degrading context quality —
-    // the next validation starts fresh with the design doc loaded.
+    // Generate design doc if it doesn't exist yet (first validation ever),
+    // or every N validations (reset session to prevent auto-compaction).
+    let should_generate = !design_path.exists() || info.validations % DESIGN_DOC_INTERVAL == 0;
+    if should_generate {
+        request_design_doc(server, &info.session_id, project, cwd).await;
+    }
     if info.validations % DESIGN_DOC_INTERVAL == 0 {
-        request_design_doc(server, &info.session_id, project).await;
         info.session_id = new_uuid();
         info.created = false;
         info.validations = 0;
@@ -227,15 +235,11 @@ async fn persist_project(
     server.save().await;
 }
 
-fn load_design_doc(server: &ServerState, project: &str) -> Option<String> {
-    let path = server.designs_dir().join(format!("{project}.md"));
-    std::fs::read_to_string(path).ok()
-}
-
 async fn request_design_doc(
     server: &ServerState,
     session_id: &str,
     project: &str,
+    cwd: &str,
 ) {
     let prompt = "Summarize your current understanding of this project's \
         architecture into a concise design document. Cover: key modules, \
@@ -243,10 +247,10 @@ async fn request_design_doc(
         common task decomposition pitfalls. Output ONLY the document content, \
         no preamble.";
 
-    match call_claude(prompt, session_id, true, None).await {
+    let design_path = server.designs_dir().join(format!("{project}.md"));
+    match call_claude(prompt, session_id, true, &design_path, cwd).await {
         Ok(doc) => {
-            let path = server.designs_dir().join(format!("{project}.md"));
-            if let Err(e) = std::fs::write(&path, &doc) {
+            if let Err(e) = std::fs::write(&design_path, &doc) {
                 eprintln!("failed to write design doc: {e}");
             } else {
                 eprintln!("updated design doc for {project}");
@@ -260,7 +264,8 @@ async fn call_claude(
     prompt: &str,
     session_id: &str,
     resume: bool,
-    design_doc: Option<&str>,
+    design_path: &std::path::Path,
+    cwd: &str,
 ) -> Result<String> {
     let mut cmd = Command::new("claude");
     cmd.arg("-p")
@@ -271,16 +276,20 @@ async fn call_claude(
         .arg("dontAsk")
         .arg("--allowedTools")
         .arg(ALLOWED_TOOLS.join(","));
+    if !cwd.is_empty() {
+        cmd.current_dir(cwd);
+    }
     cmd.env_remove("CLAUDECODE");
 
     if resume {
         cmd.arg("--resume").arg(session_id);
     } else {
         let mut system = load_architect_prompt()?;
-        if let Some(doc) = design_doc {
-            system.push_str("\n\n## Existing Design Document\n\n");
-            system.push_str(doc);
-        }
+        system.push_str(&format!(
+            "\n\n## Design Document\n\nRead the design document at `{}` \
+             before validating. If the file doesn't exist yet, proceed without it.",
+            design_path.display()
+        ));
         cmd.arg("--session-id").arg(session_id);
         cmd.arg("--system-prompt").arg(system);
     }

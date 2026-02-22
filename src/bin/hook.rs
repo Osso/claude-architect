@@ -11,29 +11,28 @@ fn main() {
 
     let json: serde_json::Value = match serde_json::from_str(&input) {
         Ok(v) => v,
-        Err(_) => return, // Not JSON, allow
+        Err(_) => return,
     };
 
-    let tool_name = json
-        .get("tool_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    if let Some(request) = extract_request(&json) {
+        validate_and_respond(request);
+    }
+}
+
+fn extract_request(json: &serde_json::Value) -> Option<Request> {
+    let tool_name = json.get("tool_name")?.as_str()?;
     if tool_name != "Task" {
-        return; // Only intercept Task() calls
+        return None;
     }
 
-    let tool_input = match json.get("tool_input") {
-        Some(v) => v,
-        None => return,
-    };
-
+    let tool_input = json.get("tool_input")?;
     let subagent_type = tool_input
         .get("subagent_type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
     if should_skip(subagent_type) {
-        return;
+        return None;
     }
 
     let description = tool_input
@@ -45,20 +44,24 @@ fn main() {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let project = derive_project();
-    let prompt_summary = truncate(prompt, 2000);
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let project = derive_project(&cwd);
 
-    let request = Request::Validate {
+    Some(Request::Validate {
         project,
         goal: description.to_string(),
-        tasks: vec![prompt_summary],
-    };
+        tasks: vec![truncate(prompt, 2000)],
+        cwd,
+    })
+}
 
+fn validate_and_respond(request: Request) {
     let path = socket_path();
     let response = match Client::call::<_, Request, Response>(&path, &request) {
         Ok(r) => r,
         Err(e) => {
-            // Service unavailable — allow the task through
             eprintln!("claude-architect-hook: service error: {e}");
             return;
         }
@@ -69,19 +72,17 @@ fn main() {
             if contains_needs_changes(&verdict) {
                 println!("{}", deny_json(&verdict));
             }
-            // VERDICT: ok — allow through (exit 0)
         }
         Response::Error(e) => {
             eprintln!("claude-architect-hook: architect error: {e}");
-            // Allow through on error
         }
         Response::Pong => {}
     }
 }
 
-fn derive_project() -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+fn derive_project(cwd: &str) -> String {
+    std::path::Path::new(cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
 }

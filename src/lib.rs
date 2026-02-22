@@ -6,6 +6,8 @@ pub enum Request {
         project: String,
         goal: String,
         tasks: Vec<String>,
+        /// Working directory of the calling project.
+        cwd: String,
     },
     Ping,
 }
@@ -112,6 +114,7 @@ mod tests {
             project: "test-project".into(),
             goal: "deploy feature".into(),
             tasks: vec!["write code".into(), "run tests".into()],
+            cwd: "/home/user/projects/test".into(),
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: Request = rmp_serde::from_slice(&bytes).unwrap();
