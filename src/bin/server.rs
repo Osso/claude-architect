@@ -32,6 +32,8 @@ struct SessionInfo {
     session_id: String,
     created: bool,
     validations: u32,
+    /// Buffered completion reports, drained into the next validation prompt.
+    pending_reports: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -159,6 +161,7 @@ async fn get_project_state(
                         session_id: pp.session_id.clone(),
                         created: true,
                         validations: pp.validations,
+                        pending_reports: Vec::new(),
                     }),
                 }),
                 None => Arc::new(ProjectState {
@@ -166,6 +169,7 @@ async fn get_project_state(
                         session_id: new_uuid(),
                         created: false,
                         validations: 0,
+                        pending_reports: Vec::new(),
                     }),
                 }),
             }
@@ -205,7 +209,17 @@ async fn handle_validate(
 ) -> Result<String> {
     let mut info = ps.mutex.lock().await;
 
-    let prompt = build_validation_prompt(goal, tasks);
+    let mut prompt = build_validation_prompt(goal, tasks);
+
+    // Drain buffered completion reports into the prompt.
+    if !info.pending_reports.is_empty() {
+        prompt.push_str("\n## Completed Since Last Validation\n\n");
+        for report in info.pending_reports.drain(..) {
+            prompt.push_str(&report);
+            prompt.push('\n');
+        }
+    }
+
     let design_path = server.designs_dir().join(format!("{project}.md"));
 
     let response = call_claude(
@@ -234,6 +248,7 @@ async fn handle_validate(
         info.session_id = new_uuid();
         info.created = false;
         info.validations = 0;
+        info.pending_reports.clear();
         persist_project(server, project, &info.session_id, 0).await;
     }
 
@@ -255,33 +270,24 @@ async fn handle_reset(
     info.session_id = new_uuid();
     info.created = false;
     info.validations = 0;
+    info.pending_reports.clear();
     persist_project(server, project, &info.session_id, 0).await;
 
     Ok(format!("Session reset for {project}. Design doc regenerated."))
 }
 
 async fn handle_report(
-    server: &ServerState,
+    _server: &ServerState,
     ps: Arc<ProjectState>,
-    project: &str,
+    _project: &str,
     task_description: &str,
     assessment: &str,
-    cwd: &str,
+    _cwd: &str,
 ) -> Result<String> {
-    let info = ps.mutex.lock().await;
-
-    if !info.created {
-        return Ok("No active session to report to".to_string());
-    }
-
-    let prompt = format!(
-        "## Task Completion Report\n\n\
-         Task: {task_description}\n\
-         Status: {assessment}"
-    );
-
-    let design_path = server.designs_dir().join(format!("{project}.md"));
-    call_claude(&prompt, &info.session_id, true, &design_path, cwd).await
+    let mut info = ps.mutex.lock().await;
+    let report = format!("- {task_description}: {assessment}");
+    info.pending_reports.push(report);
+    Ok("buffered".to_string())
 }
 
 async fn persist_project(

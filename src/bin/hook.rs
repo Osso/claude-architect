@@ -150,10 +150,13 @@ fn try_post_tool_use(
         cwd,
     };
 
-    let path = socket_path();
-    if let Err(e) = Client::call::<_, Request, Response>(&path, &request) {
-        eprintln!("claude-architect-hook: report failed: {e}");
-    }
+    // Fire-and-forget: send report to daemon in a background thread.
+    std::thread::spawn(move || {
+        let path = socket_path();
+        if let Err(e) = Client::call::<_, Request, Response>(&path, &request) {
+            eprintln!("claude-architect-hook: report failed: {e}");
+        }
+    });
 
     if contains_incomplete(&assessment) {
         println!("{}", feedback_json(&assessment));
