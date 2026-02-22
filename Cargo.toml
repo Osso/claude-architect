@@ -1,0 +1,26 @@
+[package]
+name = "claude-architect"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "claude-architect"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "claude-architect-mcp"
+path = "src/bin/mcp.rs"
+
+[[bin]]
+name = "claude-architect-hook"
+path = "src/bin/hook.rs"
+
+[dependencies]
+anyhow = "1"
+peercred-ipc = { path = "../../lib/peercred-ipc" }
+qdrant-client = "1.13"
+rmcp = { version = "0.9", features = ["server", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
