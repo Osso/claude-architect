@@ -222,7 +222,7 @@ async fn handle_validate(
 
     let design_path = server.designs_dir().join(format!("{project}.md"));
 
-    let response = call_claude(
+    let result = call_claude(
         &prompt,
         &info.session_id,
         info.created,
@@ -231,6 +231,12 @@ async fn handle_validate(
         120,
     )
     .await?;
+
+    if let Some(ref new_id) = result.new_session_id {
+        eprintln!("session expired for {project}, reset to {new_id}");
+        info.session_id = new_id.clone();
+        info.created = true;
+    }
 
     info.validations += 1;
     if !info.created {
@@ -266,7 +272,7 @@ async fn handle_validate(
         });
     }
 
-    Ok(response)
+    Ok(result.output)
 }
 
 async fn handle_reset(
@@ -342,8 +348,8 @@ async fn request_design_doc(
 
     let design_path = server.designs_dir().join(format!("{project}.md"));
     match call_claude(prompt, &session_id, true, &design_path, &cwd, 300).await {
-        Ok(doc) => {
-            if let Err(e) = std::fs::write(&design_path, &doc) {
+        Ok(result) => {
+            if let Err(e) = std::fs::write(&design_path, &result.output) {
                 eprintln!("failed to write design doc: {e}");
             } else {
                 eprintln!("updated design doc for {project}");
@@ -353,7 +359,33 @@ async fn request_design_doc(
     }
 }
 
+struct CallResult {
+    output: String,
+    /// Set when a stale session was detected and a fresh one was created.
+    new_session_id: Option<String>,
+}
+
 async fn call_claude(
+    prompt: &str,
+    session_id: &str,
+    resume: bool,
+    design_path: &std::path::Path,
+    cwd: &str,
+    timeout_secs: u64,
+) -> Result<CallResult> {
+    match run_claude(prompt, session_id, resume, design_path, cwd, timeout_secs).await {
+        Ok(output) => Ok(CallResult { output, new_session_id: None }),
+        Err(e) if resume && format!("{e:#}").contains("No conversation found") => {
+            eprintln!("session {session_id} expired, starting fresh");
+            let new_id = new_uuid();
+            let output = run_claude(prompt, &new_id, false, design_path, cwd, timeout_secs).await?;
+            Ok(CallResult { output, new_session_id: Some(new_id) })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn run_claude(
     prompt: &str,
     session_id: &str,
     resume: bool,
