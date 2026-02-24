@@ -228,6 +228,7 @@ async fn handle_validate(
         info.created,
         &design_path,
         cwd,
+        120,
     )
     .await?;
 
@@ -340,7 +341,7 @@ async fn request_design_doc(
         no preamble.";
 
     let design_path = server.designs_dir().join(format!("{project}.md"));
-    match call_claude(prompt, &session_id, true, &design_path, &cwd).await {
+    match call_claude(prompt, &session_id, true, &design_path, &cwd, 300).await {
         Ok(doc) => {
             if let Err(e) = std::fs::write(&design_path, &doc) {
                 eprintln!("failed to write design doc: {e}");
@@ -358,6 +359,7 @@ async fn call_claude(
     resume: bool,
     design_path: &std::path::Path,
     cwd: &str,
+    timeout_secs: u64,
 ) -> Result<String> {
     let mut cmd = Command::new("claude");
     cmd.arg("-p")
@@ -392,11 +394,11 @@ async fn call_claude(
 
     let child = cmd.spawn().context("spawn claude")?;
     let output = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(timeout_secs),
         child.wait_with_output(),
     )
     .await
-    .context("claude CLI timed out after 120s")?
+    .context(format!("claude CLI timed out after {}s", timeout_secs))?
     .context("spawn claude")?;
 
     if !output.status.success() {
