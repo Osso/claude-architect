@@ -7,9 +7,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::process::Command;
 use tokio::sync::Mutex;
+
+/// Absolute path to the `claude` CLI, resolved once at startup.
+static CLAUDE_BIN: OnceLock<PathBuf> = OnceLock::new();
 
 const DESIGN_DOC_INTERVAL: u32 = 20;
 
@@ -77,6 +80,13 @@ impl ServerState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let claude_bin = which::which("claude").context(
+        "claude CLI not found in PATH. Ensure ~/.local/bin is in PATH \
+         or set Environment=PATH=... in the systemd unit.",
+    )?;
+    eprintln!("using claude at {}", claude_bin.display());
+    CLAUDE_BIN.set(claude_bin).unwrap();
+
     let path = socket_path();
     let server = Server::bind(&path)?;
     eprintln!("claude-architect listening on {path}");
@@ -393,7 +403,7 @@ async fn run_claude(
     cwd: &str,
     timeout_secs: u64,
 ) -> Result<String> {
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(CLAUDE_BIN.get().unwrap());
     cmd.arg("-p")
         .arg(prompt)
         .arg("--model")

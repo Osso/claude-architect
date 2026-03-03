@@ -111,6 +111,7 @@ pub fn contains_incomplete(assessment: &str) -> bool {
 /// Build the validation prompt sent to claude.
 pub fn build_validation_prompt(goal: &str, tasks: &[String]) -> String {
     let mut prompt = String::new();
+    prompt.push_str("VALIDATE this task decomposition. Do NOT solve, implement, or execute the tasks. Only check for conflicts, gaps, ordering, and scope issues. Return VERDICT + structured assessment.\n\n");
     prompt.push_str("## Goal\n\n");
     prompt.push_str(goal);
     prompt.push_str("\n\n## Tasks to Validate\n\n");
@@ -315,7 +316,8 @@ mod tests {
             "deploy service",
             &["write code".into(), "run tests".into()],
         );
-        assert!(prompt.starts_with("## Goal\n\ndeploy service"));
+        assert!(prompt.starts_with("VALIDATE this task decomposition."));
+        assert!(prompt.contains("## Goal\n\ndeploy service"));
         assert!(prompt.contains("1. write code\n"));
         assert!(prompt.contains("2. run tests\n"));
     }
