@@ -1,0 +1,9 @@
+[Unit]
+Description=Claude Architect Service
+
+[Service]
+ExecStart=/usr/bin/claude-architect
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
