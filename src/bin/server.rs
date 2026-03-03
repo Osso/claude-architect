@@ -2,17 +2,14 @@ use anyhow::{Context, Result};
 use claude_architect::{
     Request, Response, build_validation_prompt, socket_path, strip_frontmatter,
 };
+use llm_sdk::Backend;
 use peercred_ipc::Server;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
-use tokio::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
-
-/// Absolute path to the `claude` CLI, resolved once at startup.
-static CLAUDE_BIN: OnceLock<PathBuf> = OnceLock::new();
 
 const DESIGN_DOC_INTERVAL: u32 = 20;
 
@@ -80,13 +77,6 @@ impl ServerState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let claude_bin = which::which("claude").context(
-        "claude CLI not found in PATH. Ensure ~/.local/bin is in PATH \
-         or set Environment=PATH=... in the systemd unit.",
-    )?;
-    eprintln!("using claude at {}", claude_bin.display());
-    CLAUDE_BIN.set(claude_bin).unwrap();
-
     let path = socket_path();
     let server = Server::bind(&path)?;
     eprintln!("claude-architect listening on {path}");
@@ -141,9 +131,7 @@ async fn dispatch(state: Arc<ServerState>, request: Request) -> Response {
             cwd,
         } => {
             let ps = get_project_state(&state, &project).await;
-            match handle_report(&state, ps, &project, &task_description, &assessment, &cwd)
-                .await
-            {
+            match handle_report(&state, ps, &project, &task_description, &assessment, &cwd).await {
                 Ok(ack) => Response::Verdict(ack),
                 Err(e) => Response::Error(format!("{e:#}")),
             }
@@ -158,10 +146,7 @@ async fn dispatch(state: Arc<ServerState>, request: Request) -> Response {
     }
 }
 
-async fn get_project_state(
-    state: &ServerState,
-    project: &str,
-) -> Arc<ProjectState> {
+async fn get_project_state(state: &ServerState, project: &str) -> Arc<ProjectState> {
     let mut map = state.projects.lock().await;
     map.entry(project.to_string())
         .or_insert_with(|| {
@@ -245,7 +230,13 @@ async fn apply_validate_result(
     let should_reset = info.validations % DESIGN_DOC_INTERVAL == 0;
     let session_id_for_doc = info.session_id.clone();
     if should_reset {
-        append_log(&server.data_dir, project, &LogEntry::SessionReset { timestamp: now_utc() });
+        append_log(
+            &server.data_dir,
+            project,
+            &LogEntry::SessionReset {
+                timestamp: now_utc(),
+            },
+        );
         info.session_id = new_uuid();
         info.created = false;
         info.validations = 0;
@@ -267,18 +258,43 @@ async fn handle_validate(
     let prompt = build_prompt_with_reports(goal, tasks, &mut info);
     let design_path = server.designs_dir().join(format!("{project}.md"));
 
-    let result = call_claude(&prompt, &info.session_id, info.created, &design_path, cwd, 120).await?;
+    let result = call_claude(
+        &prompt,
+        &info.session_id,
+        info.created,
+        &design_path,
+        cwd,
+        120,
+    )
+    .await?;
 
     let ts = now_utc();
-    append_log(&server.data_dir, project, &LogEntry::User { text: prompt.clone(), timestamp: ts.clone() });
-    append_log(&server.data_dir, project, &LogEntry::Assistant {
-        text: result.output.text.clone(),
-        timestamp: ts,
-        usage: result.output.usage.clone(),
-    });
+    append_log(
+        &server.data_dir,
+        project,
+        &LogEntry::User {
+            text: prompt.clone(),
+            timestamp: ts.clone(),
+        },
+    );
+    append_log(
+        &server.data_dir,
+        project,
+        &LogEntry::Assistant {
+            text: result.output.text.clone(),
+            timestamp: ts,
+            usage: result.output.usage.as_ref().map(to_log_usage),
+        },
+    );
 
-    let (should_generate, _, session_id_for_doc) =
-        apply_validate_result(&server, project, &mut info, &design_path, result.new_session_id).await;
+    let (should_generate, _, session_id_for_doc) = apply_validate_result(
+        &server,
+        project,
+        &mut info,
+        &design_path,
+        result.new_session_id,
+    )
+    .await;
     let project_owned = project.to_string();
     let cwd_owned = cwd.to_string();
     drop(info);
@@ -303,7 +319,13 @@ async fn handle_reset(
     let session_id_for_doc = info.session_id.clone();
     let was_created = info.created;
 
-    append_log(&server.data_dir, project, &LogEntry::SessionReset { timestamp: now_utc() });
+    append_log(
+        &server.data_dir,
+        project,
+        &LogEntry::SessionReset {
+            timestamp: now_utc(),
+        },
+    );
     info.session_id = new_uuid();
     info.created = false;
     info.validations = 0;
@@ -314,10 +336,18 @@ async fn handle_reset(
 
     if was_created {
         // Reset is user-triggered and infrequent; await the doc generation directly.
-        request_design_doc(server, session_id_for_doc, project.to_string(), cwd.to_string()).await;
+        request_design_doc(
+            server,
+            session_id_for_doc,
+            project.to_string(),
+            cwd.to_string(),
+        )
+        .await;
     }
 
-    Ok(format!("Session reset for {project}. Design doc regenerated."))
+    Ok(format!(
+        "Session reset for {project}. Design doc regenerated."
+    ))
 }
 
 async fn handle_report(
@@ -334,12 +364,7 @@ async fn handle_report(
     Ok("buffered".to_string())
 }
 
-async fn persist_project(
-    server: &ServerState,
-    project: &str,
-    session_id: &str,
-    validations: u32,
-) {
+async fn persist_project(server: &ServerState, project: &str, session_id: &str, validations: u32) {
     let mut persisted = server.persisted.lock().await;
     persisted.insert(
         project.to_string(),
@@ -377,17 +402,12 @@ async fn request_design_doc(
     }
 }
 
-struct ClaudeOutput {
-    text: String,
-    usage: Option<LogUsage>,
-}
-
 #[derive(Serialize, Clone)]
 struct LogUsage {
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_creation: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
 }
 
 #[derive(Serialize)]
@@ -396,13 +416,17 @@ enum LogEntry {
     #[serde(rename = "user")]
     User { text: String, timestamp: String },
     #[serde(rename = "assistant")]
-    Assistant { text: String, timestamp: String, usage: Option<LogUsage> },
+    Assistant {
+        text: String,
+        timestamp: String,
+        usage: Option<LogUsage>,
+    },
     #[serde(rename = "session_reset")]
     SessionReset { timestamp: String },
 }
 
 struct CallResult {
-    output: ClaudeOutput,
+    output: llm_sdk::Output,
     /// Set when a stale session was detected and a fresh one was created.
     new_session_id: Option<String>,
 }
@@ -415,15 +439,67 @@ async fn call_claude(
     cwd: &str,
     timeout_secs: u64,
 ) -> Result<CallResult> {
-    match run_claude(prompt, session_id, resume, design_path, cwd, timeout_secs).await {
-        Ok(output) => Ok(CallResult { output, new_session_id: None }),
-        Err(e) if resume && format!("{e:#}").contains("No conversation found") => {
+    let claude = build_claude_cmd(session_id, resume, design_path, cwd, timeout_secs)?;
+    match claude.complete(prompt).await {
+        Ok(output) => Ok(CallResult {
+            output,
+            new_session_id: None,
+        }),
+        Err(llm_sdk::Error::SessionExpired) if resume => {
             eprintln!("session {session_id} expired, starting fresh");
             let new_id = new_uuid();
-            let output = run_claude(prompt, &new_id, false, design_path, cwd, timeout_secs).await?;
-            Ok(CallResult { output, new_session_id: Some(new_id) })
+            let claude = build_claude_cmd(&new_id, false, design_path, cwd, timeout_secs)?;
+            let output = claude
+                .complete(prompt)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(CallResult {
+                output,
+                new_session_id: Some(new_id),
+            })
         }
-        Err(e) => Err(e),
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+fn build_claude_cmd(
+    session_id: &str,
+    resume: bool,
+    design_path: &std::path::Path,
+    cwd: &str,
+    timeout_secs: u64,
+) -> Result<llm_sdk::claude::Claude> {
+    let mut claude = llm_sdk::claude::Claude::new()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .model("opus")
+        .effort("low")
+        .permission_mode("dontAsk")
+        .allowed_tools(ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect())
+        .timeout(Duration::from_secs(timeout_secs))
+        .env_remove("CLAUDECODE");
+    if !cwd.is_empty() {
+        claude = claude.working_dir(cwd);
+    }
+    if resume {
+        claude = claude.resume(session_id);
+    } else {
+        let mut system = load_architect_prompt()?;
+        system.push_str(&format!(
+            "\n\n## Design Document\n\nRead the design document at `{}` \
+             before validating. If the file doesn't exist yet, proceed without it.",
+            design_path.display()
+        ));
+        claude = claude.session_id(session_id).system_prompt(system);
+    }
+    Ok(claude)
+}
+
+fn to_log_usage(u: &llm_sdk::TokenUsage) -> LogUsage {
+    LogUsage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cache_read_input_tokens: u.cache_read_input_tokens,
+        cache_creation_input_tokens: u.cache_creation_input_tokens,
     }
 }
 
@@ -433,7 +509,11 @@ fn append_log(data_dir: &std::path::Path, project: &str, entry: &LogEntry) {
     let path = logs_dir.join(format!("{project}.jsonl"));
     if let Ok(json) = serde_json::to_string(entry) {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = writeln!(f, "{json}");
         }
     }
@@ -468,109 +548,9 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     (y as i32, m, d)
 }
 
-fn build_claude_command(
-    prompt: &str,
-    session_id: &str,
-    resume: bool,
-    design_path: &std::path::Path,
-    cwd: &str,
-) -> Result<Command> {
-    let mut cmd = Command::new(CLAUDE_BIN.get().unwrap());
-    cmd.arg("-p")
-        .arg(prompt)
-        .arg("--output-format")
-        .arg("json")
-        .arg("--model")
-        .arg("opus")
-        .arg("--effort")
-        .arg("low")
-        .arg("--permission-mode")
-        .arg("dontAsk")
-        .arg("--allowedTools")
-        .arg(ALLOWED_TOOLS.join(","));
-    if !cwd.is_empty() {
-        cmd.current_dir(cwd);
-    }
-    cmd.env_remove("CLAUDECODE");
-    if resume {
-        cmd.arg("--resume").arg(session_id);
-    } else {
-        let mut system = load_architect_prompt()?;
-        system.push_str(&format!(
-            "\n\n## Design Document\n\nRead the design document at `{}` \
-             before validating. If the file doesn't exist yet, proceed without it.",
-            design_path.display()
-        ));
-        cmd.arg("--session-id").arg(session_id);
-        cmd.arg("--system-prompt").arg(system);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    Ok(cmd)
-}
-
-fn parse_claude_output(stdout: &[u8]) -> ClaudeOutput {
-    let text_raw = String::from_utf8_lossy(stdout);
-
-    // Output is a JSON array — find the "result" entry
-    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text_raw) {
-        if let Some(result_entry) = arr.iter().find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result")) {
-            let text = result_entry.get("result").and_then(|r| r.as_str()).unwrap_or("").to_string();
-            let usage = result_entry.get("usage").map(|u| LogUsage {
-                input: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                output: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                cache_read: u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                cache_creation: u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            });
-            return ClaudeOutput { text, usage };
-        }
-    }
-
-    // Fallback: try as single object (older format)
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text_raw) {
-        if let Some(result) = val.get("result").and_then(|r| r.as_str()) {
-            let usage = val.get("usage").map(|u| LogUsage {
-                input: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                output: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                cache_read: u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                cache_creation: u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            });
-            return ClaudeOutput { text: result.to_string(), usage };
-        }
-    }
-
-    ClaudeOutput { text: text_raw.to_string(), usage: None }
-}
-
-async fn run_claude(
-    prompt: &str,
-    session_id: &str,
-    resume: bool,
-    design_path: &std::path::Path,
-    cwd: &str,
-    timeout_secs: u64,
-) -> Result<ClaudeOutput> {
-    let mut cmd = build_claude_command(prompt, session_id, resume, design_path, cwd)?;
-    let child = cmd.spawn().context("spawn claude")?;
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        child.wait_with_output(),
-    )
-    .await
-    .context(format!("claude CLI timed out after {}s", timeout_secs))?
-    .context("spawn claude")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("claude exited {}: {stderr}", output.status);
-    }
-
-    Ok(parse_claude_output(&output.stdout))
-}
-
 fn load_architect_prompt() -> Result<String> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let path = format!("{home}/.claude/agents/architect.md");
-    let content =
-        std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+    let content = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
     Ok(strip_frontmatter(&content).to_string())
 }

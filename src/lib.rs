@@ -10,7 +10,10 @@ pub enum Request {
         cwd: String,
     },
     /// Regenerate design doc and reset session for a project.
-    Reset { project: String, cwd: String },
+    Reset {
+        project: String,
+        cwd: String,
+    },
     /// Brief completion report from a finished task (assessed by Haiku).
     Report {
         project: String,
@@ -29,8 +32,7 @@ pub enum Response {
 }
 
 pub fn socket_path() -> String {
-    let dir =
-        std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR must be set");
+    let dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR must be set");
     format!("{dir}/claude-architect.sock")
 }
 
@@ -257,9 +259,7 @@ mod tests {
 
     #[test]
     fn needs_changes_requires_verdict_prefix() {
-        assert!(!contains_needs_changes(
-            "this needs-changes but no VERDICT"
-        ));
+        assert!(!contains_needs_changes("this needs-changes but no VERDICT"));
     }
 
     #[test]
@@ -282,10 +282,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(reason.contains("bad plan"));
-        assert_eq!(
-            parsed["hookSpecificOutput"]["permissionDecision"],
-            "deny"
-        );
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
     #[test]
@@ -312,10 +309,8 @@ mod tests {
 
     #[test]
     fn prompt_includes_goal_and_tasks() {
-        let prompt = build_validation_prompt(
-            "deploy service",
-            &["write code".into(), "run tests".into()],
-        );
+        let prompt =
+            build_validation_prompt("deploy service", &["write code".into(), "run tests".into()]);
         assert!(prompt.starts_with("VALIDATE this task decomposition."));
         assert!(prompt.contains("## Goal\n\ndeploy service"));
         assert!(prompt.contains("1. write code\n"));
@@ -346,10 +341,7 @@ mod tests {
     fn feedback_json_basic() {
         let json = feedback_json("task incomplete");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            parsed["hookSpecificOutput"]["hookEventName"],
-            "PostToolUse"
-        );
+        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PostToolUse");
         let ctx = parsed["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap();

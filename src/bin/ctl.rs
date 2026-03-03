@@ -27,7 +27,11 @@ fn reset(args: &[String]) {
     let cwd = args
         .get(1)
         .cloned()
-        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        })
         .unwrap_or_default();
 
     let request = Request::Reset { project, cwd };

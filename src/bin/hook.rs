@@ -83,7 +83,11 @@ fn extract_validate_request(json: &serde_json::Value) -> Option<Request> {
 
 fn validate_and_respond(request: Request) {
     let path = socket_path();
-    let response = match Client::call_timeout::<_, Request, Response>(&path, &request, Duration::from_secs(180)) {
+    let response = match Client::call_timeout::<_, Request, Response>(
+        &path,
+        &request,
+        Duration::from_secs(180),
+    ) {
         Ok(r) => r,
         Err(IpcError::Timeout(_)) => {
             eprintln!("claude-architect-hook: architect validation timed out, allowing");
@@ -116,13 +120,8 @@ fn handle_post_tool_use(json: &serde_json::Value) {
     }
 }
 
-fn try_post_tool_use(
-    json: &serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let tool_name = json
-        .get("tool_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+fn try_post_tool_use(json: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     if tool_name != "Task" {
         return Ok(());
     }
@@ -166,7 +165,9 @@ fn try_post_tool_use(
     // Fire-and-forget: send report to daemon in a background thread.
     std::thread::spawn(move || {
         let path = socket_path();
-        if let Err(e) = Client::call_timeout::<_, Request, Response>(&path, &request, Duration::from_secs(30)) {
+        if let Err(e) =
+            Client::call_timeout::<_, Request, Response>(&path, &request, Duration::from_secs(30))
+        {
             if !matches!(e, IpcError::Timeout(_)) {
                 eprintln!("claude-architect-hook: report failed: {e}");
             }

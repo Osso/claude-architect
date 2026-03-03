@@ -5,7 +5,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::time::Duration;
@@ -44,10 +44,7 @@ impl ArchitectMcp {
     #[tool(
         description = "Validate a task decomposition before spawning workers. Checks for conflicts, gaps, ordering issues, and scope problems. Returns a structured verdict."
     )]
-    async fn architect_validate(
-        &self,
-        Parameters(params): Parameters<ValidateParams>,
-    ) -> String {
+    async fn architect_validate(&self, Parameters(params): Parameters<ValidateParams>) -> String {
         let cwd = params.cwd.unwrap_or_else(|| {
             std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
