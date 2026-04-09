@@ -75,12 +75,15 @@ pub fn contains_needs_changes(verdict: &str) -> bool {
         .any(|line| line.contains("VERDICT:") && line.contains("needs-changes"))
 }
 
+const PRE_TOOL_USE_DENY_PREFIX: &str = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Architect: "#;
+const PERMISSION_REASON_SUFFIX: &str = r#""}}"#;
+const POST_TOOL_USE_FEEDBACK_PREFIX: &str =
+    r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"Architect: "#;
+const ADDITIONAL_CONTEXT_SUFFIX: &str = r#""}}"#;
+
 /// Build the deny JSON for a PreToolUse hook response.
 pub fn deny_json(reason: &str) -> String {
-    let escaped = reason.replace('\\', "\\\\").replace('"', "\\\"");
-    format!(
-        r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Architect: {escaped}"}}}}"#
-    )
+    build_hook_json(PRE_TOOL_USE_DENY_PREFIX, reason, PERMISSION_REASON_SUFFIX)
 }
 
 /// Build the prompt for Haiku to assess whether a task was accomplished.
@@ -97,9 +100,10 @@ pub fn build_assessment_prompt(description: &str, result: &str) -> String {
 
 /// Build the PostToolUse response JSON with additionalContext feedback.
 pub fn feedback_json(feedback: &str) -> String {
-    let escaped = feedback.replace('\\', "\\\\").replace('"', "\\\"");
-    format!(
-        r#"{{"hookSpecificOutput":{{"hookEventName":"PostToolUse","additionalContext":"Architect: {escaped}"}}}}"#
+    build_hook_json(
+        POST_TOOL_USE_FEEDBACK_PREFIX,
+        feedback,
+        ADDITIONAL_CONTEXT_SUFFIX,
     )
 }
 
@@ -108,6 +112,15 @@ pub fn contains_incomplete(assessment: &str) -> bool {
     assessment
         .lines()
         .any(|line| line.starts_with("INCOMPLETE"))
+}
+
+fn build_hook_json(prefix: &str, message: &str, suffix: &str) -> String {
+    let escaped = escape_json_string(message);
+    [prefix, &escaped, suffix].concat()
+}
+
+fn escape_json_string(message: &str) -> String {
+    message.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Build the validation prompt sent to claude.

@@ -3,7 +3,7 @@ use claude_architect::{
     Request, Response, build_validation_prompt, socket_path, strip_frontmatter,
 };
 use llm_sdk::Backend;
-use peercred_ipc::Server;
+use peercred_ipc::{Connection, Server};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,6 +12,11 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 const DESIGN_DOC_INTERVAL: u32 = 20;
+const UUID_16_BIT_MASK: u16 = 0xFFFF;
+const UUID_12_BIT_MASK: u16 = 0x0FFF;
+const UUID_VARIANT_CLEAR_MASK: u16 = 0x3FFF;
+const UUID_VARIANT_RFC4122_BITS: u16 = 0x8000;
+const UUID_48_BIT_MASK: u64 = 0xFFFF_FFFF_FFFF;
 
 const ALLOWED_TOOLS: &[&str] = &[
     "Read",
@@ -81,30 +86,14 @@ async fn main() -> Result<()> {
     let server = Server::bind(&path)?;
     eprintln!("claude-architect listening on {path}");
 
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp/claude"))
-        .join("claude-architect");
-    std::fs::create_dir_all(data_dir.join("designs"))?;
-    std::fs::create_dir_all(data_dir.join("logs"))?;
+    let data_dir = init_data_dir()?;
     let state = ServerState::load(data_dir);
 
     loop {
         let (mut conn, _caller) = server.accept().await?;
         let state = state.clone();
         tokio::spawn(async move {
-            let request: Request = match conn.read().await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("read error: {e}");
-                    return;
-                }
-            };
-
-            let response = dispatch(state, request).await;
-
-            if let Err(e) = conn.write(&response).await {
-                eprintln!("write error: {e}");
-            }
+            handle_connection(state, &mut conn).await;
         });
     }
 }
@@ -188,10 +177,10 @@ fn new_uuid() -> String {
     format!(
         "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
         (a >> 32) as u32,
-        (a >> 16) as u16 & 0xFFFF,
-        a as u16 & 0x0FFF,
-        (b >> 48) as u16 & 0x3FFF | 0x8000,
-        b & 0xFFFF_FFFF_FFFF,
+        (a >> 16) as u16 & UUID_16_BIT_MASK,
+        a as u16 & UUID_12_BIT_MASK,
+        (b >> 48) as u16 & UUID_VARIANT_CLEAR_MASK | UUID_VARIANT_RFC4122_BITS,
+        b & UUID_48_BIT_MASK,
     )
 }
 
@@ -257,35 +246,8 @@ async fn handle_validate(
     let mut info = ps.mutex.lock().await;
     let prompt = build_prompt_with_reports(goal, tasks, &mut info);
     let design_path = server.designs_dir().join(format!("{project}.md"));
-
-    let result = call_claude(
-        &prompt,
-        &info.session_id,
-        info.created,
-        &design_path,
-        cwd,
-        120,
-    )
-    .await?;
-
-    let ts = now_utc();
-    append_log(
-        &server.data_dir,
-        project,
-        &LogEntry::User {
-            text: prompt.clone(),
-            timestamp: ts.clone(),
-        },
-    );
-    append_log(
-        &server.data_dir,
-        project,
-        &LogEntry::Assistant {
-            text: result.output.text.clone(),
-            timestamp: ts,
-            usage: result.output.usage.as_ref().map(to_log_usage),
-        },
-    );
+    let result = run_validation(&info, &prompt, &design_path, cwd).await?;
+    log_validation_exchange(&server.data_dir, project, &prompt, &result.output);
 
     let (should_generate, _, session_id_for_doc) = apply_validate_result(
         &server,
@@ -300,9 +262,7 @@ async fn handle_validate(
     drop(info);
 
     if should_generate {
-        tokio::spawn(async move {
-            request_design_doc(server, session_id_for_doc, project_owned, cwd_owned).await;
-        });
+        spawn_design_doc_request(server, session_id_for_doc, project_owned, cwd_owned);
     }
 
     Ok(result.output.text)
@@ -375,6 +335,84 @@ async fn persist_project(server: &ServerState, project: &str, session_id: &str, 
     );
     drop(persisted);
     server.save().await;
+}
+
+fn init_data_dir() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/claude"))
+        .join("claude-architect");
+    std::fs::create_dir_all(data_dir.join("designs"))?;
+    std::fs::create_dir_all(data_dir.join("logs"))?;
+    Ok(data_dir)
+}
+
+async fn handle_connection(state: Arc<ServerState>, conn: &mut Connection) {
+    let request = match conn.read().await {
+        Ok(request) => request,
+        Err(e) => {
+            eprintln!("read error: {e}");
+            return;
+        }
+    };
+
+    let response = dispatch(state, request).await;
+    if let Err(e) = conn.write(&response).await {
+        eprintln!("write error: {e}");
+    }
+}
+
+async fn run_validation(
+    info: &SessionInfo,
+    prompt: &str,
+    design_path: &std::path::Path,
+    cwd: &str,
+) -> Result<CallResult> {
+    call_claude(
+        prompt,
+        &info.session_id,
+        info.created,
+        design_path,
+        cwd,
+        120,
+    )
+    .await
+}
+
+fn log_validation_exchange(
+    data_dir: &std::path::Path,
+    project: &str,
+    prompt: &str,
+    output: &llm_sdk::Output,
+) {
+    let timestamp = now_utc();
+    append_log(
+        data_dir,
+        project,
+        &LogEntry::User {
+            text: prompt.to_string(),
+            timestamp: timestamp.clone(),
+        },
+    );
+    append_log(
+        data_dir,
+        project,
+        &LogEntry::Assistant {
+            text: output.text.clone(),
+            timestamp,
+            usage: output.usage.as_ref().map(to_log_usage),
+        },
+    );
+}
+
+fn spawn_design_doc_request(
+    server: Arc<ServerState>,
+    session_id: String,
+    project: String,
+    cwd: String,
+) {
+    tokio::spawn(async move {
+        request_design_doc(server, session_id, project, cwd).await;
+    });
 }
 
 async fn request_design_doc(

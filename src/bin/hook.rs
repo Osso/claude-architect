@@ -36,42 +36,11 @@ fn handle_pre_tool_use(json: &serde_json::Value) {
 }
 
 fn extract_validate_request(json: &serde_json::Value) -> Option<Request> {
-    let tool_name = json.get("tool_name")?.as_str()?;
-    if tool_name != "Task" {
-        return None;
-    }
-
-    let tool_input = json.get("tool_input")?;
-    let subagent_type = tool_input
-        .get("subagent_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if should_skip(subagent_type) {
-        return None;
-    }
-
-    let description = tool_input
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let prompt = tool_input
-        .get("prompt")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let project = derive_project(&cwd);
-
-    // Send first 200 chars of prompt as context, not the full detailed prompt.
-    // The architect only needs enough to check for conflicts/gaps.
-    let summary = if prompt.is_empty() {
-        description.to_string()
-    } else {
-        truncate(prompt, 200)
-    };
+    let tool_input = task_tool_input(json)?;
+    let description = string_field(tool_input, "description");
+    let prompt = string_field(tool_input, "prompt");
+    let (cwd, project) = current_project_context();
+    let summary = summarize_task(description, prompt);
 
     Some(Request::Validate {
         project,
@@ -121,58 +90,19 @@ fn handle_post_tool_use(json: &serde_json::Value) {
 }
 
 fn try_post_tool_use(json: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
-    let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-    if tool_name != "Task" {
+    let Some(tool_input) = task_tool_input_result(json)? else {
         return Ok(());
-    }
+    };
 
-    let tool_input = json.get("tool_input").ok_or("no tool_input")?;
-    let subagent_type = tool_input
-        .get("subagent_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if should_skip(subagent_type) {
-        return Ok(());
-    }
-
-    let description = tool_input
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown task");
-
+    let description = string_field_or(tool_input, "description", "unknown task");
     let tool_response = extract_response_text(json);
     if tool_response.is_empty() {
         return Ok(());
     }
 
-    let truncated = truncate(&tool_response, 4000);
-    let prompt = build_assessment_prompt(description, &truncated);
-
-    let assessment = call_haiku(&prompt)?;
-
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let project = derive_project(&cwd);
-
-    let request = Request::Report {
-        project,
-        task_description: description.to_string(),
-        assessment: assessment.clone(),
-        cwd,
-    };
-
-    // Fire-and-forget: send report to daemon in a background thread.
-    std::thread::spawn(move || {
-        let path = socket_path();
-        if let Err(e) =
-            Client::call_timeout::<_, Request, Response>(&path, &request, Duration::from_secs(30))
-        {
-            if !matches!(e, IpcError::Timeout(_)) {
-                eprintln!("claude-architect-hook: report failed: {e}");
-            }
-        }
-    });
+    let assessment = assess_task_completion(description, &tool_response)?;
+    let request = build_report_request(description, assessment.clone());
+    send_report_async(request);
 
     if contains_incomplete(&assessment) {
         println!("{}", feedback_json(&assessment));
@@ -213,4 +143,95 @@ fn derive_project(cwd: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
+}
+
+fn task_tool_input<'a>(json: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    let tool_name = json.get("tool_name")?.as_str()?;
+    if tool_name != "Task" {
+        return None;
+    }
+
+    let tool_input = json.get("tool_input")?;
+    if should_skip(string_field(tool_input, "subagent_type")) {
+        return None;
+    }
+
+    Some(tool_input)
+}
+
+fn task_tool_input_result<'a>(
+    json: &'a serde_json::Value,
+) -> Result<Option<&'a serde_json::Value>, Box<dyn std::error::Error>> {
+    let tool_name = string_field(json, "tool_name");
+    if tool_name != "Task" {
+        return Ok(None);
+    }
+
+    let tool_input = json.get("tool_input").ok_or("no tool_input")?;
+    if should_skip(string_field(tool_input, "subagent_type")) {
+        return Ok(None);
+    }
+
+    Ok(Some(tool_input))
+}
+
+fn string_field<'a>(json: &'a serde_json::Value, key: &str) -> &'a str {
+    json.get(key).and_then(|value| value.as_str()).unwrap_or("")
+}
+
+fn string_field_or<'a>(json: &'a serde_json::Value, key: &str, default: &'a str) -> &'a str {
+    json.get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or(default)
+}
+
+fn current_project_context() -> (String, String) {
+    let cwd = std::env::current_dir()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let project = derive_project(&cwd);
+    (cwd, project)
+}
+
+fn summarize_task(description: &str, prompt: &str) -> String {
+    if prompt.is_empty() {
+        return description.to_string();
+    }
+
+    // Send first 200 chars of prompt as context, not the full detailed prompt.
+    // The architect only needs enough to check for conflicts/gaps.
+    truncate(prompt, 200)
+}
+
+fn assess_task_completion(
+    description: &str,
+    tool_response: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let truncated = truncate(tool_response, 4000);
+    let prompt = build_assessment_prompt(description, &truncated);
+    call_haiku(&prompt)
+}
+
+fn build_report_request(description: &str, assessment: String) -> Request {
+    let (cwd, project) = current_project_context();
+    Request::Report {
+        project,
+        task_description: description.to_string(),
+        assessment,
+        cwd,
+    }
+}
+
+fn send_report_async(request: Request) {
+    // Fire-and-forget: send report to daemon in a background thread.
+    std::thread::spawn(move || {
+        let path = socket_path();
+        if let Err(e) =
+            Client::call_timeout::<_, Request, Response>(&path, &request, Duration::from_secs(30))
+        {
+            if !matches!(e, IpcError::Timeout(_)) {
+                eprintln!("claude-architect-hook: report failed: {e}");
+            }
+        }
+    });
 }
