@@ -113,7 +113,22 @@ pub fn contains_incomplete(assessment: &str) -> bool {
 /// Build the validation prompt sent to claude.
 pub fn build_validation_prompt(goal: &str, tasks: &[String]) -> String {
     let mut prompt = String::new();
-    prompt.push_str("VALIDATE this task decomposition. Do NOT solve, implement, or execute the tasks. Only check for conflicts, gaps, ordering, and scope issues. Return VERDICT + structured assessment.\n\n");
+    prompt.push_str(
+        "VALIDATE this task decomposition. Do NOT solve, implement, or execute the tasks.\n\n",
+    );
+    prompt.push_str("Check for: conflicts, gaps, ordering, scope issues, AND **loop risks**.\n\n");
+    prompt.push_str("## Loop Risk Detection (CRITICAL)\n\n");
+    prompt
+        .push_str("Flag any task that is likely to cause an agent to spiral. Common patterns:\n\n");
+    prompt.push_str("- **Unbounded investigation**: \"investigate why X doesn't work\", \"debug Y\", \"figure out Z\" without a concrete stop condition or max-depth. These lead to search→read→search cycles where the agent explores layer after layer without converging.\n");
+    prompt.push_str("- **Binary hunting without bisection**: tasks that require finding a needle in a haystack (e.g., \"find where model X gets filtered\") should specify a strategy (binary search, strace, add logging) rather than open-ended exploration.\n");
+    prompt.push_str("- **Missing success criteria**: if a task has no way to verify it's done, the agent will keep trying variations. Every task needs a concrete \"done when\" check.\n");
+    prompt.push_str("- **Too many unknowns in one task**: if a task requires understanding 3+ systems to complete, it should be split. Each task should touch at most 1-2 systems.\n");
+    prompt.push_str("- **Retry-prone tasks**: tasks involving external services, builds, or deployments that might fail transiently. These need explicit retry limits.\n\n");
+    prompt.push_str("For each flagged task, suggest:\n");
+    prompt.push_str("1. A concrete stop condition (\"stop after checking X, Y, Z\")\n");
+    prompt.push_str("2. A max-depth or time-box (\"spend at most N steps on this\")\n");
+    prompt.push_str("3. An alternative decomposition that reduces ambiguity\n\n");
     prompt.push_str("## Goal\n\n");
     prompt.push_str(goal);
     prompt.push_str("\n\n## Tasks to Validate\n\n");
@@ -311,7 +326,7 @@ mod tests {
     fn prompt_includes_goal_and_tasks() {
         let prompt =
             build_validation_prompt("deploy service", &["write code".into(), "run tests".into()]);
-        assert!(prompt.starts_with("VALIDATE this task decomposition."));
+        assert!(prompt.contains("VALIDATE this task decomposition."));
         assert!(prompt.contains("## Goal\n\ndeploy service"));
         assert!(prompt.contains("1. write code\n"));
         assert!(prompt.contains("2. run tests\n"));
@@ -321,7 +336,9 @@ mod tests {
     fn prompt_empty_tasks() {
         let prompt = build_validation_prompt("goal", &[]);
         assert!(prompt.contains("## Tasks to Validate\n\n"));
-        assert!(!prompt.contains("1."));
+        // No numbered tasks after the Tasks header
+        let after_header = prompt.split("## Tasks to Validate\n\n").last().unwrap();
+        assert!(after_header.trim().is_empty());
     }
 
     // --- build_assessment_prompt ---
