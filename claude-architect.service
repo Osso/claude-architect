@@ -2,8 +2,8 @@
 Description=Claude Architect Service
 
 [Service]
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
-ExecStart=%h/.local/bin/claude-architect
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/.cargo/bin/claude-architect
 Restart=on-failure
 
 [Install]
