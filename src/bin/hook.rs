@@ -1,3 +1,6 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![cfg_attr(coverage_nightly, coverage(off))]
+
 use claude_architect::{
     Request, Response, build_assessment_prompt, contains_incomplete, contains_needs_changes,
     deny_json, feedback_json, should_skip, socket_path, truncate,

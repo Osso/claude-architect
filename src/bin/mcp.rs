@@ -1,3 +1,6 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![cfg_attr(coverage_nightly, coverage(off))]
+
 use anyhow::Result;
 use claude_architect::{Request, Response, socket_path};
 use peercred_ipc::Client;
